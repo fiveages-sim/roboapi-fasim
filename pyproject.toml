@@ -1,0 +1,35 @@
+[project]
+name = "roboapi-fasim"
+version = "0.1.0"
+description = "FaSim / ROS 2 arm, gripper and wrist-camera adapters for RoboAPI"
+authors = [
+  {name = "Huang Zhenbiao", email = "biao876990970@hotmail.com"},
+]
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "roboapi>=0.4.5,<0.5",
+  "numpy>=1.26,<2",
+  "scipy>=1.11,<1.16",
+]
+
+[project.entry-points."roboapi.arms"]
+fasim = "roboapi_fasim.arm:arm_plugin"
+
+[project.entry-points."roboapi.grippers"]
+fasim = "roboapi_fasim.gripper:gripper_plugin"
+
+[project.entry-points."roboapi.cameras"]
+fasim = "roboapi_fasim.camera:camera_plugin"
+
+[project.urls]
+Homepage = "https://github.com/fiveages-sim/roboapi-fasim"
+Repository = "https://github.com/fiveages-sim/roboapi-fasim"
+
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
