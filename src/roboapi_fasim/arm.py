@@ -6,25 +6,34 @@ from dataclasses import dataclass
 
 from roboapi.hardware import ArmConfig, ArmPlugin, ComponentOption
 
-DEFAULT_JOINT_NAMES = (
-    "shoulder_pan_joint,shoulder_lift_joint,elbow_joint,"
-    "wrist_1_joint,wrist_2_joint,wrist_3_joint"
+from .probe import (
+    DEFAULT_BASE_FRAME,
+    DEFAULT_CURRENT_TARGET_TOPIC,
+    DEFAULT_GRIPPER_COMMAND,
+    DEFAULT_GRIPPER_CONTROLLER,
+    DEFAULT_GRIPPER_JOINT,
+    DEFAULT_JOINT_NAMES,
+    DEFAULT_JOINT_STATES_TOPIC,
+    DEFAULT_POSE_TOPIC,
+    DEFAULT_TARGET_TOPIC,
+    print_probe_notes,
+    probe_arm_hints,
 )
 
 
 @dataclass
 class FasimArmConfig(ArmConfig):
     type: str = "fasim"
-    pose_topic: str = "/left_current_pose"
-    target_topic: str = "/left_target"
-    current_target_topic: str = "/left_current_target"
-    joint_states_topic: str = "/joint_states"
-    base_frame: str = "base_link"
+    pose_topic: str = DEFAULT_POSE_TOPIC
+    target_topic: str = DEFAULT_TARGET_TOPIC
+    current_target_topic: str = DEFAULT_CURRENT_TARGET_TOPIC
+    joint_states_topic: str = DEFAULT_JOINT_STATES_TOPIC
+    base_frame: str = DEFAULT_BASE_FRAME
     joint_names: str = DEFAULT_JOINT_NAMES
     namespace: str = ""
-    gripper_joint_name: str = "gripper_joint"
-    gripper_command_topic: str = "/gripper_joint/position_command"
-    gripper_controller_name: str = "gripper_controller"
+    gripper_joint_name: str = DEFAULT_GRIPPER_JOINT
+    gripper_command_topic: str = DEFAULT_GRIPPER_COMMAND
+    gripper_controller_name: str = DEFAULT_GRIPPER_CONTROLLER
     gripper_closed: float = 0.8
     gripper_open: float = 0.0
 
@@ -40,17 +49,23 @@ class FasimArmConfig(ArmConfig):
 
 
 def configure(option, setup):
+    hints = probe_arm_hints()
+    if hints.ok:
+        print_probe_notes("已用 ros2_robot_interface 探测机械臂话题（回车接受建议值）", hints.notes)
+    else:
+        print_probe_notes("未能探测 ROS 2 图，使用内置默认值", hints.notes or ["无详情"])
+
     return option.config_type(
-        pose_topic=setup.ask("末端位姿话题（法兰中心 / tool0）", "/left_current_pose"),
-        target_topic=setup.ask("末端目标话题", "/left_target"),
-        current_target_topic=setup.ask("当前目标话题（可空）", "/left_current_target"),
-        joint_states_topic=setup.ask("关节状态话题", "/joint_states"),
-        base_frame=setup.ask("原生基坐标系", "base_link"),
-        joint_names=setup.ask("手臂关节名（逗号分隔）", DEFAULT_JOINT_NAMES),
+        pose_topic=setup.ask("末端位姿话题（法兰中心 / tool0）", hints.pose_topic),
+        target_topic=setup.ask("末端目标话题", hints.target_topic),
+        current_target_topic=setup.ask("当前目标话题（可空）", hints.current_target_topic),
+        joint_states_topic=setup.ask("关节状态话题", hints.joint_states_topic),
+        base_frame=setup.ask("原生基坐标系", hints.base_frame),
+        joint_names=setup.ask("手臂关节名（逗号分隔）", hints.joint_names),
         namespace="",  # official setup.ask rejects a blank default
-        gripper_joint_name=setup.ask("夹爪关节名", "gripper_joint"),
-        gripper_command_topic=setup.ask("夹爪位置命令话题", "/gripper_joint/position_command"),
-        gripper_controller_name=setup.ask("夹爪控制器名", "gripper_controller"),
+        gripper_joint_name=setup.ask("夹爪关节名", hints.gripper_joint_name),
+        gripper_command_topic=setup.ask("夹爪位置命令话题", hints.gripper_command_topic),
+        gripper_controller_name=setup.ask("夹爪控制器名", hints.gripper_controller_name),
     )
 
 
@@ -62,6 +77,7 @@ def arm_plugin():
         configure=configure,
         setup_notes=(
             "控制点是 tool0（法兰中心、Z 向外）。请确认运控发布的位姿是 tool0，而不是 ROS-Industrial flange。",
+            "configure 会尝试用 ros2_robot_interface 扫描话题 / joint_states / pose frame，作为向导默认值。",
         ),
     )
 

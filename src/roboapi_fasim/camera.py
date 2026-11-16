@@ -8,11 +8,13 @@ import time
 
 from roboapi.hardware import CameraConfig, ComponentOption, ComponentPlugin
 
+from .probe import DEFAULT_CAMERA_TOPIC, print_probe_notes, probe_camera_hints
+
 
 @dataclass
 class FasimCameraConfig(CameraConfig):
     type: str = "fasim"
-    topic: str = "/wrist_camera/rgb"
+    topic: str = DEFAULT_CAMERA_TOPIC
     namespace: str = ""
     stale_after_s: float = 0.5
 
@@ -26,9 +28,29 @@ class FasimCameraConfig(CameraConfig):
             raise ValueError("camera.topic is required")
 
 
+def _choose_camera_topic(setup, hints) -> str:
+    if not hints.ok or not hints.topics:
+        return setup.ask("腕部相机 Image 话题", hints.preferred or DEFAULT_CAMERA_TOPIC)
+
+    if len(hints.topics) == 1:
+        return setup.ask("腕部相机 Image 话题", hints.topics[0])
+
+    choices = list(hints.topics) + ["手动输入..."]
+    index = setup.choose("腕部相机 Image 话题（已探测）", choices)
+    if index >= len(hints.topics):
+        return setup.ask("腕部相机 Image 话题", hints.preferred)
+    return hints.topics[index]
+
+
 def configure(option, setup):
+    hints = probe_camera_hints()
+    if hints.ok:
+        print_probe_notes("已探测 sensor_msgs/Image 话题", hints.notes)
+    else:
+        print_probe_notes("未能探测相机话题，使用内置默认值", hints.notes or ["无详情"])
+
     return option.config_type(
-        topic=setup.ask("腕部相机 Image 话题", "/wrist_camera/rgb"),
+        topic=_choose_camera_topic(setup, hints),
         namespace="",  # official setup.ask rejects a blank default
     )
 
@@ -40,6 +62,7 @@ def camera_plugin():
         configure=configure,
         setup_notes=(
             "需要仿真或驱动向该话题发布 1280×720、约 30 FPS 的 RGB 图像；不要裁剪、补边或镜像。",
+            "configure 会扫描 Image 话题（如 /acepro2/rgb、/action6/rgb），供向导选择。",
         ),
     )
 

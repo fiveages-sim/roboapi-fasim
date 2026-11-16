@@ -40,7 +40,7 @@ roboapi init -c ~/FaSim-Isaac/robots/manipulators/UniversalRobots/UR5e/roboapi/c
 roboapi http -c ~/FaSim-Isaac/robots/manipulators/UniversalRobots/UR5e/roboapi/config.yaml
 ```
 
-该目录已有面向 `env/fiveages_acepro2.usda` 的配置（相机话题 `/acepro2/rgb`）。向导里选择三套 `fasim` 组件。默认话题面向 UR5e + 2F-85 + `ocs2_arm_controller`：
+该目录已有面向 `env/fiveages_acepro2.usda` 的配置（相机话题 `/acepro2/rgb`）。向导里选择三套 `fasim` 组件。若仿真已在跑且 `ROS_DOMAIN_ID` 一致，`roboapi init` 会用 `ros2_robot_interface` 扫描话题，把位姿 / 关节 / 夹爪 / Image 相机话题填成默认值（仍可手改）。探测失败时回退到下面的内置默认（UR5e + 2F-85 + `ocs2_arm_controller`）：
 
 | 组件 | 默认 |
 | --- | --- |
