@@ -12,6 +12,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 TopicsAndTypes = List[Tuple[str, List[str]]]
 
+DEFAULT_ARM_SIDE = "left"
 DEFAULT_POSE_TOPIC = "/left_current_pose"
 DEFAULT_TARGET_TOPIC = "/left_target"
 DEFAULT_CURRENT_TARGET_TOPIC = "/left_current_target"
@@ -26,21 +27,29 @@ DEFAULT_GRIPPER_COMMAND = "/gripper_joint/position_command"
 DEFAULT_GRIPPER_CONTROLLER = "gripper_controller"
 DEFAULT_CAMERA_TOPIC = "/wrist_camera/rgb"
 
-_POSE_CANDIDATES = (
-    "/left_current_pose",
-    "/right_current_pose",
-    "/current_pose",
-)
-_TARGET_CANDIDATES = (
-    "/left_target",
-    "/right_target",
-    "/target",
-)
-_CURRENT_TARGET_CANDIDATES = (
-    "/left_current_target",
-    "/right_current_target",
-    "/current_target",
-)
+# Per-side topic presets. Left also accepts unprefixed single-arm names.
+_SIDE_PRESETS = {
+    "left": {
+        "pose": ("/left_current_pose", "/current_pose"),
+        "target": ("/left_target", "/target"),
+        "current_target": ("/left_current_target", "/current_target"),
+        "gripper_command": (
+            "/left_gripper_joint/position_command",
+            "/gripper_joint/position_command",
+        ),
+        "gripper_controller": ("left_gripper_controller", "gripper_controller"),
+        "gripper_joint": ("left_gripper_joint", "gripper_joint"),
+    },
+    "right": {
+        "pose": ("/right_current_pose",),
+        "target": ("/right_target",),
+        "current_target": ("/right_current_target",),
+        "gripper_command": ("/right_gripper_joint/position_command",),
+        "gripper_controller": ("right_gripper_controller",),
+        "gripper_joint": ("right_gripper_joint",),
+    },
+}
+
 _JOINT_STATES_CANDIDATES = (
     "/joint_states",
 )
@@ -63,6 +72,8 @@ _CAMERA_NAME_HINTS = (
 
 @dataclass
 class ArmProbeHints:
+    arm_side: str = DEFAULT_ARM_SIDE
+    available_sides: List[str] = field(default_factory=lambda: [DEFAULT_ARM_SIDE])
     pose_topic: str = DEFAULT_POSE_TOPIC
     target_topic: str = DEFAULT_TARGET_TOPIC
     current_target_topic: str = DEFAULT_CURRENT_TARGET_TOPIC
@@ -74,6 +85,26 @@ class ArmProbeHints:
     gripper_controller_name: str = DEFAULT_GRIPPER_CONTROLLER
     ok: bool = False
     notes: List[str] = field(default_factory=list)
+
+
+def normalize_arm_side(side: str | None) -> str:
+    value = (side or DEFAULT_ARM_SIDE).strip().lower()
+    if value not in _SIDE_PRESETS:
+        raise ValueError(f"arm_side must be 'left' or 'right', got {side!r}")
+    return value
+
+
+def detect_available_sides(names: Sequence[str]) -> List[str]:
+    name_set = set(names)
+    sides: List[str] = []
+    if any(t in name_set for t in ("/left_current_pose", "/left_target")):
+        sides.append("left")
+    if any(t in name_set for t in ("/right_current_pose", "/right_target")):
+        sides.append("right")
+    if not sides:
+        # No side-tagged Cartesian topics: treat as single left arm (legacy UR5e).
+        sides = ["left"]
+    return sides
 
 
 @dataclass
@@ -141,37 +172,41 @@ def _endswith_present(names: Sequence[str], suffix: str) -> List[str]:
     return sorted(name for name in names if name.endswith(suffix))
 
 
-def _pick_gripper_command(names: Sequence[str]) -> Optional[str]:
-    preferred = (
-        "/gripper_joint/position_command",
-        "/left_gripper_joint/position_command",
-        "/right_gripper_joint/position_command",
-    )
+def _pick_gripper_command(names: Sequence[str], side: str) -> Optional[str]:
+    preferred = _SIDE_PRESETS[side]["gripper_command"]
     hit = _first_present(names, preferred)
     if hit:
         return hit
     matches = []
     for name in names:
+        lower = name.lower()
+        if side not in lower and side != "left":
+            continue
+        if side == "left" and "right" in lower:
+            continue
         for suffix in _GRIPPER_COMMAND_SUFFIXES:
-            if "gripper" in name and name.endswith(suffix):
+            if "gripper" in lower and name.endswith(suffix):
                 matches.append(name)
                 break
     return sorted(matches)[0] if matches else None
 
 
-def _pick_gripper_controller(names: Sequence[str]) -> Optional[str]:
+def _pick_gripper_controller(names: Sequence[str], side: str) -> Optional[str]:
+    preferred = _SIDE_PRESETS[side]["gripper_controller"]
+    for controller in preferred:
+        if any(n.endswith(f"/{controller}/target_percent") or n.endswith(f"/{controller}/target_command") for n in names):
+            return controller
+    # Fallback: infer from any matching percent topic on this side.
     for name in names:
-        if name.endswith("/gripper_controller/target_percent"):
-            # /gripper_controller/target_percent -> gripper_controller
+        lower = name.lower()
+        if side == "left" and "right" in lower:
+            continue
+        if side == "right" and "right" not in lower:
+            continue
+        if name.endswith("/target_percent") and "gripper" in lower:
             parts = [p for p in name.strip("/").split("/") if p]
             if len(parts) >= 2:
                 return parts[-2]
-        if name.endswith("/left_gripper_controller/target_percent"):
-            return "left_gripper_controller"
-        if name.endswith("/right_gripper_controller/target_percent"):
-            return "right_gripper_controller"
-    if any(n.endswith("/gripper_controller/target_command") for n in names):
-        return "gripper_controller"
     return None
 
 
@@ -265,55 +300,113 @@ def sample_pose_frame_id(topic: str, timeout_s: float = 3.0) -> Optional[str]:
     return frame[0] if frame else None
 
 
-def _arm_joint_names_from_state(names: Sequence[str]) -> str:
+def _arm_joint_names_from_state(names: Sequence[str], side: str) -> str:
+    other = "right" if side == "left" else "left"
+
+    def _is_gripper_like(name: str) -> bool:
+        lower = name.lower()
+        return "gripper" in lower or "finger" in lower or "hand" in lower
+
+    sided = [
+        name
+        for name in names
+        if side in name.lower() and other not in name.lower() and not _is_gripper_like(name)
+    ]
+    if sided:
+        return ",".join(sided)
+
     filtered = [
         name
         for name in names
-        if "gripper" not in name.lower()
-        and "finger" not in name.lower()
-        and "hand" not in name.lower()
+        if other not in name.lower() and not _is_gripper_like(name)
     ]
     use = filtered or list(names)
     return ",".join(use) if use else DEFAULT_JOINT_NAMES
 
 
-def _gripper_joint_from_state(names: Sequence[str]) -> Optional[str]:
+def _gripper_joint_from_state(names: Sequence[str], side: str) -> Optional[str]:
+    preferred = _SIDE_PRESETS[side]["gripper_joint"]
+    hit = _first_present(names, preferred)
+    if hit:
+        return hit
+    other = "right" if side == "left" else "left"
     for name in names:
         lower = name.lower()
-        if "gripper" in lower or "finger" in lower:
+        if ("gripper" in lower or "finger" in lower) and other not in lower:
+            if side == "right" and side not in lower:
+                continue
             return name
     return None
 
 
-def probe_arm_hints(*, sample_live: bool = True, max_attempts: int = 12) -> ArmProbeHints:
+def side_topic_defaults(side: str) -> dict:
+    """Static defaults for a side when the ROS graph has no matching topics."""
+    side = normalize_arm_side(side)
+    preset = _SIDE_PRESETS[side]
+    return {
+        "arm_side": side,
+        "pose_topic": preset["pose"][0],
+        "target_topic": preset["target"][0],
+        "current_target_topic": preset["current_target"][0],
+        "gripper_command_topic": preset["gripper_command"][0],
+        "gripper_controller_name": preset["gripper_controller"][0],
+        "gripper_joint_name": preset["gripper_joint"][0],
+    }
+
+
+def probe_arm_hints(
+    *,
+    arm_side: str | None = None,
+    sample_live: bool = True,
+    max_attempts: int = 12,
+) -> ArmProbeHints:
     """Build arm setup defaults from the live ROS 2 graph when possible."""
     topics_and_types, error = discover_graph(max_attempts=max_attempts)
     hints = ArmProbeHints()
     if error:
         hints.notes.append(error)
+        if arm_side:
+            hints.arm_side = normalize_arm_side(arm_side)
+            hints.available_sides = [hints.arm_side]
+            hints.__dict__.update({k: v for k, v in side_topic_defaults(hints.arm_side).items() if k != "arm_side"})
         return hints
 
     names = _topic_names(topics_and_types)
-    notes: List[str] = [f"已发现 {len(names)} 个话题"]
+    available = detect_available_sides(names)
+    hints.available_sides = available
+    if arm_side is None:
+        side = "left" if "left" in available else available[0]
+    else:
+        side = normalize_arm_side(arm_side)
+        if side not in available:
+            hints.notes.append(f"图上未看到 {side} 臂话题，仍按 {side} 预设填写")
+    hints.arm_side = side
 
-    pose = _first_present(names, _POSE_CANDIDATES)
+    # Start from side presets, then overwrite with live matches.
+    for key, value in side_topic_defaults(side).items():
+        if key != "arm_side":
+            setattr(hints, key, value)
+
+    notes: List[str] = [f"已发现 {len(names)} 个话题", f"控制臂: {side}（可选: {', '.join(available)}）"]
+    preset = _SIDE_PRESETS[side]
+
+    pose = _first_present(names, preset["pose"])
     if pose:
         hints.pose_topic = pose
         notes.append(f"位姿话题: {pose}")
 
-    target = _first_present(names, _TARGET_CANDIDATES)
+    target = _first_present(names, preset["target"])
     if target:
         hints.target_topic = target
         notes.append(f"目标话题: {target}")
 
-    current_target = _first_present(names, _CURRENT_TARGET_CANDIDATES)
+    current_target = _first_present(names, preset["current_target"])
     if current_target:
         hints.current_target_topic = current_target
         notes.append(f"当前目标话题: {current_target}")
 
     joint_states = _first_present(names, _JOINT_STATES_CANDIDATES)
     if joint_states is None:
-        # Prefixed joint_states, e.g. /ur5e/joint_states
         prefixed = _endswith_present(names, "/joint_states")
         if prefixed:
             joint_states = prefixed[0]
@@ -321,16 +414,15 @@ def probe_arm_hints(*, sample_live: bool = True, max_attempts: int = 12) -> ArmP
         hints.joint_states_topic = joint_states
         notes.append(f"关节状态: {joint_states}")
 
-    gripper_cmd = _pick_gripper_command(names)
+    gripper_cmd = _pick_gripper_command(names, side)
     if gripper_cmd:
         hints.gripper_command_topic = gripper_cmd
         notes.append(f"夹爪命令: {gripper_cmd}")
-        # Derive joint leaf from topic when possible: /gripper_joint/position_command
         parts = [p for p in gripper_cmd.strip("/").split("/") if p]
         if len(parts) >= 2 and parts[-1] == "position_command":
             hints.gripper_joint_name = parts[-2]
 
-    gripper_ctrl = _pick_gripper_controller(names)
+    gripper_ctrl = _pick_gripper_controller(names, side)
     if gripper_ctrl:
         hints.gripper_controller_name = gripper_ctrl
         notes.append(f"夹爪控制器: {gripper_ctrl}")
@@ -338,16 +430,19 @@ def probe_arm_hints(*, sample_live: bool = True, max_attempts: int = 12) -> ArmP
     if sample_live and joint_states:
         state_names = sample_joint_state_names(joint_states)
         if state_names:
-            hints.joint_names = _arm_joint_names_from_state(state_names)
+            hints.joint_names = _arm_joint_names_from_state(state_names, side)
             notes.append(f"关节名来自 {joint_states}（{len(hints.joint_names.split(','))} 轴）")
-            gripper_joint = _gripper_joint_from_state(state_names)
+            gripper_joint = _gripper_joint_from_state(state_names, side)
             if gripper_joint:
                 hints.gripper_joint_name = gripper_joint
                 notes.append(f"夹爪关节: {gripper_joint}")
 
-    if sample_live and pose:
-        # Prefer stamped companion if present.
-        stamped = f"{pose}/stamped" if f"{pose}/stamped" in set(names) else pose
+    if sample_live and hints.pose_topic:
+        stamped = (
+            f"{hints.pose_topic}/stamped"
+            if f"{hints.pose_topic}/stamped" in set(names)
+            else hints.pose_topic
+        )
         frame_id = sample_pose_frame_id(stamped)
         if frame_id:
             hints.base_frame = frame_id

@@ -70,7 +70,11 @@ def gripper_plugin():
 def _arm_cfg_from_gripper(cfg: FasimGripperConfig):
     from .arm import FasimArmConfig
 
+    # Infer side from gripper topics when arm config is not shared yet.
+    command = (cfg.command_topic or "").lower()
+    arm_side = "right" if "right" in command else "left"
     return FasimArmConfig(
+        arm_side=arm_side,
         joint_states_topic=cfg.joint_states_topic,
         gripper_joint_name=cfg.joint_name,
         gripper_command_topic=cfg.command_topic,
@@ -78,6 +82,10 @@ def _arm_cfg_from_gripper(cfg: FasimGripperConfig):
         gripper_closed=cfg.closed_position,
         gripper_open=cfg.open_position,
         namespace=cfg.namespace,
+        # Keep pose topics coherent with the inferred side for session identity.
+        pose_topic=f"/{arm_side}_current_pose",
+        target_topic=f"/{arm_side}_target",
+        current_target_topic=f"/{arm_side}_current_target",
     )
 
 
@@ -139,11 +147,11 @@ class FasimGripper:
         return ratio_from_position(position, self.cfg.closed_position, self.cfg.open_position)
 
     def set_ratio(self, ratio):
-        from .session import position_from_ratio
+        from .session import active_gripper_handler, position_from_ratio
 
         session = self._require()
         target = position_from_ratio(ratio, self.cfg.closed_position, self.cfg.open_position)
-        session.interface.left_gripper_handler.send_joint_positions(target)
+        active_gripper_handler(session).send_joint_positions(target)
         self._last_ratio = float(ratio)
 
     def hold(self):

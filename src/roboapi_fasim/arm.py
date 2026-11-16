@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from roboapi.hardware import ArmConfig, ArmPlugin, ComponentOption
 
 from .probe import (
+    DEFAULT_ARM_SIDE,
     DEFAULT_BASE_FRAME,
     DEFAULT_CURRENT_TARGET_TOPIC,
     DEFAULT_GRIPPER_COMMAND,
@@ -16,6 +17,7 @@ from .probe import (
     DEFAULT_JOINT_STATES_TOPIC,
     DEFAULT_POSE_TOPIC,
     DEFAULT_TARGET_TOPIC,
+    normalize_arm_side,
     print_probe_notes,
     probe_arm_hints,
 )
@@ -24,6 +26,7 @@ from .probe import (
 @dataclass
 class FasimArmConfig(ArmConfig):
     type: str = "fasim"
+    arm_side: str = DEFAULT_ARM_SIDE
     pose_topic: str = DEFAULT_POSE_TOPIC
     target_topic: str = DEFAULT_TARGET_TOPIC
     current_target_topic: str = DEFAULT_CURRENT_TARGET_TOPIC
@@ -39,23 +42,45 @@ class FasimArmConfig(ArmConfig):
 
     @property
     def connection_id(self) -> str:
-        return f"{self.pose_topic}|{self.base_frame}|tool0"
+        return f"{self.arm_side}|{self.pose_topic}|{self.base_frame}|tool0"
 
     def validate(self) -> None:
         super().validate()
+        normalize_arm_side(self.arm_side)
         for name in ("pose_topic", "target_topic", "joint_states_topic", "base_frame"):
             if not str(getattr(self, name) or "").strip():
                 raise ValueError(f"arm.{name} is required")
 
 
+def _choose_arm_side(setup, hints) -> str:
+    sides = list(hints.available_sides) or [DEFAULT_ARM_SIDE]
+    if len(sides) == 1:
+        return sides[0]
+    labels = []
+    for side in sides:
+        if side == "left":
+            labels.append("left（左臂）")
+        elif side == "right":
+            labels.append("right（右臂）")
+        else:
+            labels.append(side)
+    return sides[setup.choose("控制哪条臂", labels)]
+
+
 def configure(option, setup):
-    hints = probe_arm_hints()
+    draft = probe_arm_hints(sample_live=False)
+    side = _choose_arm_side(setup, draft)
+    hints = probe_arm_hints(arm_side=side)
     if hints.ok:
-        print_probe_notes("已用 ros2_robot_interface 探测机械臂话题（回车接受建议值）", hints.notes)
+        print_probe_notes(
+            f"已用 ros2_robot_interface 探测 {side} 臂话题（回车接受建议值）",
+            hints.notes,
+        )
     else:
         print_probe_notes("未能探测 ROS 2 图，使用内置默认值", hints.notes or ["无详情"])
 
     return option.config_type(
+        arm_side=side,
         pose_topic=setup.ask("末端位姿话题（法兰中心 / tool0）", hints.pose_topic),
         target_topic=setup.ask("末端目标话题", hints.target_topic),
         current_target_topic=setup.ask("当前目标话题（可空）", hints.current_target_topic),
@@ -77,6 +102,7 @@ def arm_plugin():
         configure=configure,
         setup_notes=(
             "控制点是 tool0（法兰中心、Z 向外）。请确认运控发布的位姿是 tool0，而不是 ROS-Industrial flange。",
+            "双臂时先选 left/right；话题会映射到 RoboAPI 单臂主通道（仍用 left_* handler）。",
             "configure 会尝试用 ros2_robot_interface 扫描话题 / joint_states / pose frame，作为向导默认值。",
         ),
     )
@@ -151,7 +177,7 @@ class FasimArm:
 
         session = self._require()
         session.prepare_control()
-        # ocs2_arm_controller follows unstamped /left_target (Pose in base_link).
+        # Selected side topics are mapped into the primary (left_*) handler slots.
         session.interface.left_arm_handler.send_target(pose7_to_msg(pose7))
 
     def hold(self):

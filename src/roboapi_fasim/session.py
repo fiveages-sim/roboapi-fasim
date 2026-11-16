@@ -71,8 +71,22 @@ class _RobotSession:
     def __init__(self, arm_cfg) -> None:
         from ros2_robot_interface import ROS2RobotInterface, ROS2RobotInterfaceConfig
 
+        from .probe import normalize_arm_side
+
         self.arm_cfg = arm_cfg
+        # Arm Cartesian: map the selected side into primary (left_*) slots.
+        # Gripper: keep real left/right fields — connect() auto-detect overwrites
+        # gripper_command_topic back to /left_* when both sides exist, so right
+        # control must use right_gripper_handler rather than remapping into left_*.
+        self.arm_side = normalize_arm_side(getattr(arm_cfg, "arm_side", None))
         joint_names = [name.strip() for name in arm_cfg.joint_names.split(",") if name.strip()]
+        gripper_kwargs: dict[str, object] = {}
+        if self.arm_side == "right":
+            gripper_kwargs["right_gripper_command_topic"] = arm_cfg.gripper_command_topic
+            gripper_kwargs["right_gripper_controller_name"] = arm_cfg.gripper_controller_name
+        else:
+            gripper_kwargs["gripper_command_topic"] = arm_cfg.gripper_command_topic
+            gripper_kwargs["left_gripper_controller_name"] = arm_cfg.gripper_controller_name
         config = ROS2RobotInterfaceConfig.default_single_arm_ocs2_arm_controller(
             joint_states_topic=arm_cfg.joint_states_topic,
             current_pose_topic=arm_cfg.pose_topic,
@@ -80,10 +94,9 @@ class _RobotSession:
             current_target_topic=arm_cfg.current_target_topic or None,
             joint_names=joint_names,
             gripper_joint_name=arm_cfg.gripper_joint_name,
-            gripper_command_topic=arm_cfg.gripper_command_topic,
             namespace=arm_cfg.namespace,
-            node_name="roboapi_fasim",
-            left_gripper_controller_name=arm_cfg.gripper_controller_name,
+            node_name=f"roboapi_fasim_{self.arm_side}",
+            **gripper_kwargs,
         )
         # Install inverted 2F-85 limits only as a hint for arrival checks; the
         # gripper driver maps RoboAPI ratios itself because min must stay <= max.
@@ -91,20 +104,104 @@ class _RobotSession:
         config.gripper_max_position = max(arm_cfg.gripper_closed, arm_cfg.gripper_open)
         self.interface = ROS2RobotInterface(config)
         self.interface.connect()
+        self._ensure_right_gripper()
         # The interface already spins robot_node on its own executor thread.
         self._control_ready = False
+
+    def _ensure_right_gripper(self) -> None:
+        """Make sure right gripper handler publishes to the configured command topic."""
+        if self.arm_side != "right":
+            return
+        from std_msgs.msg import Float64
+        from ros2_robot_interface.handler import GripperHandler, GripperType
+
+        arm_cfg = self.arm_cfg
+        self.interface.config.right_gripper_command_topic = arm_cfg.gripper_command_topic
+        self.interface.config.right_gripper_controller_name = arm_cfg.gripper_controller_name
+        right = self.interface.right_gripper_handler
+        if right is None:
+            self.interface.right_gripper_handler = GripperHandler(
+                self.interface.robot_node,
+                GripperType.RIGHT,
+                self.interface.config,
+            )
+            self.interface.right_gripper_handler.initialize()
+            return
+        if right.command_topic != arm_cfg.gripper_command_topic or right.command_pub is None:
+            right.command_topic = arm_cfg.gripper_command_topic
+            if arm_cfg.gripper_command_topic:
+                right.command_pub = self.interface.robot_node.create_publisher(
+                    Float64, arm_cfg.gripper_command_topic, 10
+                )
 
     def prepare_control(self) -> None:
         if self._control_ready:
             return
+        self._prepare_wbc_selected_arm()
         self.interface.auto_switch_fsm_for_control("arm_pose")
         self._control_ready = True
+
+    def _prepare_wbc_selected_arm(self) -> None:
+        """In WBC dual-arm mode, enable the selected arm and disable the other.
+
+        RoboAPI drives one arm only; leaving the opposite arm ENABLED lets WBC
+        keep tracking it and fight single-arm Cartesian targets.
+        """
+        interface = self.interface
+        if not getattr(interface, "is_wbc", False):
+            return
+        if not getattr(interface, "mode_command_pub", None):
+            return
+
+        if self.arm_side == "right":
+            enable_cmd, disable_cmd = "RIGHT_ARM_ENABLE", "LEFT_ARM_DISABLE"
+        else:
+            enable_cmd, disable_cmd = "LEFT_ARM_ENABLE", "RIGHT_ARM_DISABLE"
+
+        commands = ("ARMS_INDEPENDENT", enable_cmd, disable_cmd)
+        for command in commands:
+            try:
+                interface.send_mode_command(command)
+            except Exception:
+                # Non-WBC stacks or missing mode_command should not block control.
+                return
+        wait = getattr(interface, "wait_until_mode_commands_applied", None)
+        if callable(wait):
+            try:
+                wait(commands, timeout=2.0)
+            except Exception:
+                pass
 
     def close(self) -> None:
         try:
             self.interface.disconnect()
         except Exception:
             pass
+
+
+def active_arm_handler(session: "_RobotSession"):
+    """Selected-side arm handler. Cartesian topics are remapped onto left_* slots."""
+    handler = session.interface.left_arm_handler
+    if handler is None:
+        raise RuntimeError("arm handler is not available")
+    return handler
+
+
+def active_gripper_handler(session: "_RobotSession"):
+    """Selected-side gripper handler (real left/right, not remapped)."""
+    if session.arm_side == "right":
+        handler = session.interface.right_gripper_handler
+        if handler is None:
+            raise RuntimeError(
+                "right gripper handler is not available; check gripper.command_topic / controller_name"
+            )
+        return handler
+    handler = session.interface.left_gripper_handler
+    if handler is None:
+        raise RuntimeError(
+            "left gripper handler is not available; check gripper.command_topic / controller_name"
+        )
+    return handler
 
 
 def acquire_robot(arm_cfg) -> _RobotSession:
@@ -170,6 +267,7 @@ def device_identity(arm_cfg, extra: dict[str, Any] | None = None) -> dict[str, A
         "connection_id": arm_cfg.connection_id,
         "control_point": CONTROL_POINT,
         "flange_frame": FLANGE_FRAME,
+        "arm_side": getattr(arm_cfg, "arm_side", "left"),
         "base_frame": arm_cfg.base_frame,
         "pose_topic": arm_cfg.pose_topic,
         "joint_states_topic": arm_cfg.joint_states_topic,
